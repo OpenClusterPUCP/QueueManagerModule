@@ -8,10 +8,14 @@ import com.example.queuemanagermodule.repository.OperationRequestRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -23,6 +27,10 @@ public class OperationProcessorService {
     private final OperationRequestRepository operationRequestRepository;
     private final SliceControllerService sliceControllerService;
     private final ObjectMapper objectMapper;
+    private final RestTemplate restTemplate;
+
+    @Value("${slice.manager.service.base-url}")
+    private String sliceManagerBaseUrl;
 
     @Transactional
     public void processOperation(Long operationId, OperationType operationType,
@@ -56,6 +64,10 @@ public class OperationProcessorService {
             operationRequestRepository.save(operation);
 
             log.info("Operación completada exitosamente: ID={}", operationId);
+
+            // NUEVO: Notificar al Slice Manager sobre la finalización exitosa
+            notifySliceManagerSuccess(operationId, operationType, userId, result);
+
         } catch (Exception e) {
             log.error("Error procesando operación ID={}: {}", operationId, e.getMessage(), e);
 
@@ -75,9 +87,80 @@ public class OperationProcessorService {
                 operation.setErrorMessage(e.getMessage());
                 log.warn("Operación marcada como fallida después de {} intentos: ID={}",
                         operation.getRetryCount(), operationId);
+
+                // NUEVO: Notificar al Slice Manager sobre el fallo
+                notifySliceManagerFailure(operationId, operationType, userId, e.getMessage());
             }
 
             operationRequestRepository.save(operation);
+        }
+    }
+
+    // Método para notificar éxito al Slice Manager
+    private void notifySliceManagerSuccess(Long operationId, OperationType operationType,
+                                           Long userId, Map<String, Object> result) {
+        try {
+            log.info("Notificando éxito al Slice Manager para operación ID={}", operationId);
+
+            String callbackUrl = sliceManagerBaseUrl + "/operation-callback";
+
+            Map<String, Object> callbackData = new HashMap<>();
+            callbackData.put("operationId", operationId);
+            callbackData.put("operationType", operationType.toString());
+            callbackData.put("userId", userId);
+            callbackData.put("status", "SUCCESS");
+            callbackData.put("result", result);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(callbackData, headers);
+
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    callbackUrl,
+                    HttpMethod.POST,
+                    request,
+                    Map.class
+            );
+
+            log.info("Respuesta del Slice Manager: {}", response.getStatusCode());
+
+        } catch (Exception e) {
+            log.error("Error notificando éxito al Slice Manager: {}", e.getMessage(), e);
+        }
+    }
+
+    //  Método para notificar fallo al Slice Manager
+    private void notifySliceManagerFailure(Long operationId, OperationType operationType,
+                                           Long userId, String errorMessage) {
+        try {
+            log.info("Notificando fallo al Slice Manager para operación ID={}", operationId);
+
+            String callbackUrl = sliceManagerBaseUrl + "/operation-callback";
+
+            Map<String, Object> callbackData = new HashMap<>();
+            callbackData.put("operationId", operationId);
+            callbackData.put("operationType", operationType.toString());
+            callbackData.put("userId", userId);
+            callbackData.put("status", "FAILED");
+            callbackData.put("error", errorMessage);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(callbackData, headers);
+
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    callbackUrl,
+                    HttpMethod.POST,
+                    request,
+                    Map.class
+            );
+
+            log.info("Respuesta del Slice Manager: {}", response.getStatusCode());
+
+        } catch (Exception e) {
+            log.error("Error notificando fallo al Slice Manager: {}", e.getMessage(), e);
         }
     }
 
@@ -92,7 +175,6 @@ public class OperationProcessorService {
 
             case RESTART_SLICE:
                 sliceId = payload.get("sliceId").toString();
-                // Usando el mismo endpoint pero con diferente URL
                 return sliceControllerService.restartSlice(sliceId, payload);
 
             case PAUSE_VM:

@@ -36,15 +36,34 @@ public class SliceControllerService {
 
         HttpEntity<Map<String, Object>> request = new HttpEntity<>(sliceConfig, headers);
 
-        ResponseEntity<Map> response = restTemplate.exchange(
-                url,
-                HttpMethod.POST,
-                request,
-                Map.class
-        );
+        try {
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.POST,
+                    request,
+                    Map.class
+            );
 
-        log.info("Respuesta de despliegue recibida: {}", response.getStatusCode());
-        return response.getBody();
+            log.info("Respuesta de despliegue recibida: {}", response.getStatusCode());
+
+            // Verificar que la respuesta contenga los campos esperados
+            Map<String, Object> responseBody = response.getBody();
+            if (responseBody == null) {
+                throw new RuntimeException("Respuesta vacía del Slice Controller");
+            }
+
+            String status = (String) responseBody.get("status");
+            if (!"success".equals(status)) {
+                String message = (String) responseBody.getOrDefault("message", "Error desconocido");
+                String details = (String) responseBody.getOrDefault("details", "Sin detalles");
+                throw new RuntimeException("Error en Slice Controller: " + message + " - " + details);
+            }
+
+            return responseBody;
+        } catch (Exception e) {
+            log.error("Error en comunicación con Slice Controller: {}", e.getMessage(), e);
+            throw new RuntimeException("Error en comunicación con Slice Controller: " + e.getMessage(), e);
+        }
     }
 
     /**
