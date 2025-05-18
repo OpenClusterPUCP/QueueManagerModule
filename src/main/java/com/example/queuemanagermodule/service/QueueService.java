@@ -38,8 +38,4 @@ public interface QueueService {
      */
     List<QueueItem> getUserOperations(Long userId, List<OperationStatus> statuses);
 
-    /**
-     * Procesa el siguiente item de la cola con la prioridad especificada
-     */
-    void processNextQueueItem(String queueName);
 }

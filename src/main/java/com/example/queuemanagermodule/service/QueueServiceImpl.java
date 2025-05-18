@@ -27,7 +27,6 @@ public class QueueServiceImpl implements QueueService {
     private final OperationRequestRepository operationRequestRepository;
     private final QueueMetricsRepository queueMetricsRepository;
     private final KafkaProducerService kafkaProducerService;
-    private final OperationProcessorService operationProcessorService;
     private final ObjectMapper objectMapper;
 
     @Value("${queue.retry.max-attempts}")
@@ -51,69 +50,84 @@ public class QueueServiceImpl implements QueueService {
         // Prioridad base - por defecto es MEDIUM
         Priority calculatedPriority = Priority.MEDIUM;
 
-        // 1. Tipo de operación
-        switch (operationType) {
-            case DEPLOY_SLICE:
-            case STOP_SLICE:
-                // Despliegues y detenciones de slices completas son importantes
-                calculatedPriority = Priority.HIGH;
-                break;
-            case RESTART_SLICE:
-                // Reinicio de slice completa es prioridad media
-                calculatedPriority = Priority.MEDIUM;
-                break;
-            case PAUSE_VM:
-            case RESUME_VM:
-            case RESTART_VM:
-                // Operaciones en VMs individuales son prioridad media
-                calculatedPriority = Priority.MEDIUM;
-                break;
-            case SYNC_IMAGES:
-            case GENERATE_VNC_TOKEN:
-                // Operaciones de mantenimiento o secundarias son menos prioritarias
-                calculatedPriority = Priority.LOW;
-                break;
-            default:
-                // Por defecto prioridad media
-                calculatedPriority = Priority.MEDIUM;
-                break;
-        }
-
-        // 2. Tamaño de recursos (para DEPLOY_SLICE)
+        // Optimizado para DEPLOY_SLICE
         if (operationType == OperationType.DEPLOY_SLICE && payload != null) {
             try {
-                // Analizar recursos de la slice
+                // Analizar la estructura del payload actual
                 Map<String, Object> topologyInfo = (Map<String, Object>) payload.get("topology_info");
                 if (topologyInfo != null) {
-                    // Cantidad de VMs
+                    // 1. Cantidad de VMs
                     List<Map<String, Object>> vms = (List<Map<String, Object>>) topologyInfo.get("vms");
                     if (vms != null) {
                         int vmCount = vms.size();
 
-                        // Si tiene muchas VMs, considerarlo alta prioridad
+                        // Slices con muchas VMs tienen alta prioridad
                         if (vmCount > 5) {
                             calculatedPriority = Priority.HIGH;
-                        } else if (vmCount < 3) {
-                            // Slice pequeña, mantener prioridad normal o reducir
-                            if (calculatedPriority == Priority.HIGH) {
+                        } else if (vmCount <= 2) {
+                            calculatedPriority = Priority.LOW;
+                        }
+
+                        // 2. Complejidad de la topología - basada en cantidad de enlaces
+                        List<Map<String, Object>> links = (List<Map<String, Object>>) topologyInfo.get("links");
+                        if (links != null && links.size() > 3) {
+                            // Topología compleja
+                            if (calculatedPriority != Priority.HIGH) {
+                                calculatedPriority = Priority.MEDIUM;
+                            }
+                        }
+
+                        // 3. Complejidad de la red - basada en cantidad de interfaces
+                        List<Map<String, Object>> interfaces = (List<Map<String, Object>>) topologyInfo.get("interfaces");
+                        if (interfaces != null && interfaces.size() > 6) {
+                            // Muchas interfaces indican una topología compleja
+                            if (calculatedPriority != Priority.HIGH) {
                                 calculatedPriority = Priority.MEDIUM;
                             }
                         }
                     }
                 }
+
+                // 4. Flag de urgencia o importancia (si existe)
+                if (payload.containsKey("urgent") && Boolean.TRUE.equals(payload.get("urgent"))) {
+                    calculatedPriority = Priority.HIGH;
+                }
+
             } catch (Exception e) {
                 log.warn("Error analizando payload para determinar prioridad: {}", e.getMessage());
                 // Mantener la prioridad calculada hasta ahora
             }
+        } else {
+            // Para otras operaciones
+            switch (operationType) {
+                case STOP_SLICE:
+                    // Detenciones son importantes
+                    calculatedPriority = Priority.HIGH;
+                    break;
+                case RESTART_SLICE:
+                    calculatedPriority = Priority.MEDIUM;
+                    break;
+                case PAUSE_VM:
+                case RESUME_VM:
+                case RESTART_VM:
+                    calculatedPriority = Priority.MEDIUM;
+                    break;
+                case SYNC_IMAGES:
+                case GENERATE_VNC_TOKEN:
+                    calculatedPriority = Priority.LOW;
+                    break;
+                default:
+                    calculatedPriority = Priority.MEDIUM;
+                    break;
+            }
         }
 
-        // 3. Si la prioridad viene explícitamente indicada, respetarla
-        Priority explicitPriority = null;
+        // Si la prioridad viene explícitamente indicada, respetarla
         if (payload != null && payload.containsKey("priority")) {
             try {
                 String priorityStr = payload.get("priority").toString();
-                explicitPriority = Priority.valueOf(priorityStr);
-                log.info("Prioridad explícita especificada: {}", explicitPriority);
+                Priority explicitPriority = Priority.valueOf(priorityStr);
+                log.info("Usando prioridad explícita: {}", explicitPriority);
                 return explicitPriority;
             } catch (Exception e) {
                 log.warn("Prioridad especificada inválida: {}", e.getMessage());
@@ -155,7 +169,7 @@ public class QueueServiceImpl implements QueueService {
                     .clusterType(clusterType)
                     .zoneId(zoneId)
                     .userId(userId)
-                    .priority(finalPriority)  // Usar la prioridad calculada
+                    .priority(finalPriority)
                     .payloadJson(payloadJson)
                     .submittedAt(LocalDateTime.now())
                     .status(OperationStatus.PENDING)
@@ -184,7 +198,17 @@ public class QueueServiceImpl implements QueueService {
 
             // Determinar el tópico de Kafka basado en la cola
             String topicName = getKafkaTopicForQueue(queueName);
-            kafkaProducerService.sendQueueItem(topicName, queueItem);
+            boolean sent = kafkaProducerService.sendQueueItem(topicName, queueItem);
+
+            if (!sent) {
+                // Si hubo error al enviar a Kafka, marcar la operación como fallida
+                operationRequest.setStatus(OperationStatus.FAILED);
+                operationRequest.setErrorMessage("Error al publicar en Kafka");
+                operationRequest.setCompletedAt(LocalDateTime.now());
+                operationRequestRepository.save(operationRequest);
+
+                throw new RuntimeException("Error al publicar en Kafka");
+            }
 
             log.info("Operación encolada exitosamente. ID: {}, Cola: {}, Tópico: {}",
                     operationRequest.getId(), queueName, topicName);
@@ -311,81 +335,6 @@ public class QueueServiceImpl implements QueueService {
         }
 
         return results;
-    }
-
-
-
-
-    @Override
-    @Transactional
-    public void processNextQueueItem(String queueName) {
-        log.info("Procesando próximo ítem de la cola: {}", queueName);
-
-        List<OperationRequest> pendingOperations = operationRequestRepository
-                .findByQueueNameAndStatus(queueName, OperationStatus.PENDING);
-
-        if (pendingOperations.isEmpty()) {
-            log.info("No hay operaciones pendientes en la cola: {}", queueName);
-            return;
-        }
-
-        // Ordenar por fecha de envío (FIFO)
-        pendingOperations.sort((a, b) -> a.getSubmittedAt().compareTo(b.getSubmittedAt()));
-        OperationRequest nextOperation = pendingOperations.get(0);
-
-        // Actualizar estado a IN_PROGRESS
-        nextOperation.setStatus(OperationStatus.IN_PROGRESS);
-        nextOperation.setStartedAt(LocalDateTime.now());
-        operationRequestRepository.save(nextOperation);
-
-        try {
-            // Convertir payload de JSON a Map
-            Map<String, Object> payload = objectMapper.readValue(nextOperation.getPayloadJson(), Map.class);
-
-            // Procesar la operación
-            operationProcessorService.processOperation(
-                    nextOperation.getId(),
-                    nextOperation.getOperationType(),
-                    nextOperation.getClusterType(),
-                    nextOperation.getZoneId(),
-                    nextOperation.getUserId(),
-                    payload
-            );
-        } catch (Exception e) {
-            log.error("Error procesando operación ID: {}", nextOperation.getId(), e);
-
-            // Actualizar estado a FAILED
-            nextOperation.setStatus(OperationStatus.FAILED);
-            nextOperation.setErrorMessage(e.getMessage());
-            nextOperation.setCompletedAt(LocalDateTime.now());
-            operationRequestRepository.save(nextOperation);
-        }
-    }
-
-    /**
-     * Tarea programada para verificar y procesar timeouts en operaciones
-     */
-    @Scheduled(fixedRate = 60000) // cada minuto
-    @Transactional
-    public void checkForTimeouts() {
-        log.debug("Verificando timeouts en operaciones");
-
-        // Considerar timeout si una operación ha estado en IN_PROGRESS por más de 5 minutos
-        LocalDateTime timeoutThreshold = LocalDateTime.now().minusMinutes(5);
-
-        List<OperationRequest> potentialTimeouts = operationRequestRepository
-                .findByStatusAndStartedAtBefore(OperationStatus.IN_PROGRESS, timeoutThreshold);
-
-        for (OperationRequest op : potentialTimeouts) {
-            log.warn("Operación potencialmente en timeout: ID: {}, Tipo: {}, Inicio: {}",
-                    op.getId(), op.getOperationType(), op.getStartedAt());
-
-            // Marcar como TIMEOUT
-            op.setStatus(OperationStatus.TIMEOUT);
-            op.setCompletedAt(LocalDateTime.now());
-            op.setErrorMessage("Operación marcada como timeout después de 5 minutos");
-            operationRequestRepository.save(op);
-        }
     }
 
     /**

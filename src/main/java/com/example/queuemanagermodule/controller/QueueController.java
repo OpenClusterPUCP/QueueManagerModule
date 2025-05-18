@@ -128,25 +128,4 @@ public class QueueController {
             ));
         }
     }
-
-    @PostMapping("/manual-process")
-    public ResponseEntity<Map<String, Object>> manualProcessNextItem(
-            @RequestParam String queueName) {
-
-        log.info("Solicitud de procesamiento manual para cola: {}", queueName);
-
-        try {
-            queueService.processNextQueueItem(queueName);
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "Procesamiento iniciado exitosamente"
-            ));
-        } catch (Exception e) {
-            log.error("Error al procesar manualmente el siguiente ítem", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "message", "Error al procesar: " + e.getMessage()
-            ));
-        }
-    }
 }
