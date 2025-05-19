@@ -33,7 +33,12 @@ public class QueueController {
             Integer zoneId = (Integer) request.get("zoneId");
             Long userId = Long.valueOf(request.get("userId").toString());
             Map<String, Object> payload = (Map<String, Object>) request.get("payload");
-            Priority priority = Priority.valueOf((String) request.getOrDefault("priority", "MEDIUM"));
+            String priorityStr = (String) request.get("priority");
+            Priority priority = null;
+            if (priorityStr != null) {
+                priority = Priority.valueOf(priorityStr);
+            }
+            // Si priority es null, QueueServiceImpl.determinePriority() será llamado automáticamente
 
             Long operationId = queueService.enqueueOperation(
                     operationType, clusterType, zoneId, userId, payload, priority);

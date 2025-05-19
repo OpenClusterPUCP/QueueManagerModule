@@ -61,34 +61,105 @@ public class KafkaProducerService {
 
     /**
      * Extrae la clave para el mensaje basada en el tipo de operación.
+     * DEBE ser exactamente igual a la lógica del SliceIdPartitioner.
      */
     private String extractMessageKey(QueueItem queueItem) {
         try {
-            // Para DEPLOY_SLICE, extraer sliceId del payload
+            Map<String, Object> payload = queueItem.getPayload();
+            if (payload == null) {
+                log.debug("Payload es null para QueueItem ID={}", queueItem.getId());
+                return "user-" + queueItem.getUserId();
+            }
+
+            String sliceId = null;
+
+            // Para DEPLOY_SLICE - buscar en slice_info.id
             if (queueItem.getOperationType() == OperationType.DEPLOY_SLICE) {
-                Map<String, Object> payload = queueItem.getPayload();
-                if (payload != null && payload.containsKey("slice_info")) {
-                    Map<String, Object> sliceInfo = (Map<String, Object>) payload.get("slice_info");
-                    if (sliceInfo != null && sliceInfo.containsKey("id")) {
-                        return "slice-" + sliceInfo.get("id").toString();
+                log.debug("Extrayendo clave para DEPLOY_SLICE (ID: {}), payload keys: {}",
+                        queueItem.getId(), payload.keySet());
+
+                // Buscar en slice_info.id (fuente principal)
+                if (payload.containsKey("slice_info")) {
+                    Object sliceInfoObj = payload.get("slice_info");
+                    if (sliceInfoObj instanceof Map) {
+                        Map<String, Object> sliceInfo = (Map<String, Object>) sliceInfoObj;
+                        if (sliceInfo.containsKey("id")) {
+                            sliceId = String.valueOf(sliceInfo.get("id"));
+                            log.debug("DEPLOY_SLICE: SliceId extraído de slice_info.id: {}", sliceId);
+                        }
+                    }
+                }
+
+                // Buscar en network_config.slice_id como respaldo
+                if (sliceId == null && payload.containsKey("network_config")) {
+                    Object networkConfigObj = payload.get("network_config");
+                    if (networkConfigObj instanceof Map) {
+                        Map<String, Object> networkConfig = (Map<String, Object>) networkConfigObj;
+                        if (networkConfig.containsKey("slice_id")) {
+                            sliceId = String.valueOf(networkConfig.get("slice_id"));
+                            log.debug("DEPLOY_SLICE: SliceId extraído de network_config.slice_id: {}", sliceId);
+                        }
                     }
                 }
             }
-            // Para otras operaciones como STOP_SLICE, RESTART_SLICE
+            // Para operaciones de control
             else if (queueItem.getOperationType() == OperationType.STOP_SLICE ||
                     queueItem.getOperationType() == OperationType.RESTART_SLICE) {
 
-                Map<String, Object> payload = queueItem.getPayload();
-                if (payload != null && payload.containsKey("slice_id")) {
-                    return "slice-" + payload.get("slice_id").toString();
+                log.debug("Extrayendo clave para {} (ID: {}), payload keys: {}",
+                        queueItem.getOperationType(), queueItem.getId(), payload.keySet());
+
+                if (payload.containsKey("slice_id")) {
+                    sliceId = String.valueOf(payload.get("slice_id"));
+                    log.debug("{}: SliceId extraído de slice_id: {}", queueItem.getOperationType(), sliceId);
                 }
             }
-        } catch (Exception e) {
-            log.warn("Error al extraer clave del mensaje: {}", e.getMessage());
-        }
+            // Para operaciones de VM
+            else if (queueItem.getOperationType() == OperationType.PAUSE_VM ||
+                    queueItem.getOperationType() == OperationType.RESUME_VM ||
+                    queueItem.getOperationType() == OperationType.RESTART_VM) {
 
-        // Si no se encuentra sliceId específico, usar userId + operationId como clave
-        return "user-" + queueItem.getUserId() + "-op-" + queueItem.getId();
+                log.debug("Extrayendo clave para {} (ID: {}), payload keys: {}",
+                        queueItem.getOperationType(), queueItem.getId(), payload.keySet());
+
+                if (payload.containsKey("slice_id")) {
+                    sliceId = String.valueOf(payload.get("slice_id"));
+                    log.debug("{}: SliceId extraído de slice_id: {}", queueItem.getOperationType(), sliceId);
+                }
+
+                if (sliceId == null && payload.containsKey("vm_info")) {
+                    Object vmInfoObj = payload.get("vm_info");
+                    if (vmInfoObj instanceof Map) {
+                        Map<String, Object> vmInfo = (Map<String, Object>) vmInfoObj;
+                        if (vmInfo.containsKey("slice_id")) {
+                            sliceId = String.valueOf(vmInfo.get("slice_id"));
+                            log.debug("{}: SliceId extraído de vm_info.slice_id: {}", queueItem.getOperationType(), sliceId);
+                        }
+                    }
+                }
+            }
+
+            // Si encontramos sliceId, usarlo como clave
+            if (sliceId != null && !sliceId.isEmpty()) {
+                String key = "slice-" + sliceId;
+                log.info("Clave de particionamiento generada con sliceId {}: '{}'", sliceId, key);
+                return key;
+            }
+
+            // Fallback: usar solo userId
+            String fallbackKey = "user-" + queueItem.getUserId();
+            log.warn("No se encontró sliceId para operación {} (ID: {}), usando clave fallback: '{}'",
+                    queueItem.getOperationType(), queueItem.getId(), fallbackKey);
+            return fallbackKey;
+
+        } catch (Exception e) {
+            log.error("Error al extraer clave del mensaje para QueueItem ID={}: {}",
+                    queueItem.getId(), e.getMessage(), e);
+
+            String lastResortKey = "user-" + queueItem.getUserId();
+            log.warn("Usando clave de último recurso: '{}'", lastResortKey);
+            return lastResortKey;
+        }
     }
 
 }
